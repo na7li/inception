@@ -4,72 +4,82 @@
 
 ## Description
 
-Inception is a system-administration project: a small web infrastructure built from scratch with Docker, where every service runs in its own container built from its own Dockerfile.
+The goal of Inception is to build a small web infrastructure with Docker, inside a virtual machine. The result is a WordPress website at `https://mnahli.42.fr`.
 
-The stack serves a WordPress site over HTTPS at `https://mnahli.42.fr`:
+The project has three services. Each service runs in its own container, and each container is built from my own Dockerfile on `debian:bookworm`.
 
-| Service | Container | Base image | Role |
-|---|---|---|---|
-| NGINX | `nginx` | `debian:bookworm` | The only entry point. Listens on port 443 with TLS 1.2/1.3 and a self-signed certificate. Serves static files and forwards PHP requests to php-fpm. |
-| WordPress + php-fpm | `wordpress` | `debian:bookworm` | Runs the WordPress PHP code. Listens on port 9000 (FastCGI), inside the Docker network only. Installed at first start with WP-CLI. |
-| MariaDB | `mariadb` | `debian:bookworm` | The database. Listens on port 3306, inside the Docker network only. The database, the user and the root password are created at first start. |
+| Service | Container | Job |
+|---|---|---|
+| NGINX | `nginx` | The only entry point. It listens on port 443 with TLS 1.2 and 1.3, and sends PHP requests to WordPress. |
+| WordPress + php-fpm | `wordpress` | Runs the WordPress code. It listens on port 9000, reachable only from the other containers. |
+| MariaDB | `mariadb` | The database. It listens on port 3306, reachable only from the other containers. |
 
-Two named volumes keep the data on the host, in `/home/mnahli/data/mariadb` (database files) and `/home/mnahli/data/wordpress` (WordPress files, shared by nginx and php-fpm). A private bridge network `inception` connects the three containers; only nginx publishes a port.
+### Use of Docker and sources included
+
+Docker builds one image per service from a Dockerfile, and Docker Compose starts the three containers together with their network and volumes. The Makefile runs Docker Compose.
+
+```
+Makefile                      build, start, stop, clean
+srcs/docker-compose.yml       the three services, two volumes, one network
+srcs/.env                     names and passwords (not in git)
+srcs/requirements/mariadb/    Dockerfile, conf/50-server.cnf, tools/init.sh
+srcs/requirements/wordpress/  Dockerfile, conf/www.conf, tools/setup.sh
+srcs/requirements/nginx/      Dockerfile, conf/default
+```
 
 ### Main design choices
 
-- **One process per container, PID 1 is the service itself.** Each container ends with `exec` of the real server (`mysqld`, `php-fpm8.2 -F`, `nginx -g "daemon off;"`), so `docker stop` reaches the service directly and no `tail -f` or infinite loop is needed.
-- **Setup scripts that run once.** `init.sh` (MariaDB) and `setup.sh` (WordPress) check whether the volume already holds data; on the first start they create the database/users or download and install WordPress, on later starts they go straight to the server.
-- **No credentials in the images.** Every password and name comes from `srcs/.env` at run time through `env_file`; the file is ignored by git.
-- **Minimal packages.** Each Dockerfile installs only what a test required (for example `php8.2-fpm php8.2-mysql curl` for WordPress).
-- **Penultimate stable Debian** (`bookworm`), as the subject requires, with no `latest` tag anywhere.
+- **One service per container.** The main process of each container is the server itself (`mysqld`, `php-fpm`, `nginx`), so `docker stop` stops it cleanly.
+- **Setup runs only once.** On the first start, `init.sh` creates the database and its users, and `setup.sh` installs WordPress. On later starts they find the existing data and only start the server.
+- **No passwords in the images or in git.** All names and passwords come from `srcs/.env` when the containers start.
+- **Debian bookworm**, the penultimate stable version, and no `latest` tag.
+- **Data stays on the host** in `/home/mnahli/data`, so it survives when containers are removed.
 
-### Virtual machines vs Docker
+### Virtual Machines vs Docker
 
-A virtual machine runs a complete second operating system with its own kernel on emulated hardware; it is isolated but heavy (gigabytes, minutes to boot). A Docker container is a group of ordinary processes of the host kernel, isolated with namespaces (PID, network, mount, …) and limited with cgroups, started from an image made of read-only layers. It boots in a second and shares the kernel. Inception uses both: the containers run inside a Debian VM at evaluation, which gives a clean, reproducible host.
+A virtual machine runs a complete operating system with its own kernel. It is heavy: gigabytes on disk and a long boot. A Docker container is only a group of isolated processes that use the kernel of the host. It is light and starts in about one second. In this project the containers run inside a Debian virtual machine.
 
-### Secrets vs environment variables
+### Secrets vs Environment Variables
 
-Environment variables are the simplest way to pass configuration into a container (`env_file`, `-e`): they are easy to use but visible to every process in the container and in `docker inspect`. Docker secrets mount each value as a file in `/run/secrets/`, readable only by the service that declares it, and are the better choice for production. This mandatory part uses environment variables from a git-ignored `.env` file, which the subject allows; the file is never committed.
+Environment variables are the simple way to give values to a container. Any process in the container can read them, and `docker inspect` shows them. Docker secrets give each value as a file that only the chosen service can read, which is safer. This project uses environment variables from the file `srcs/.env`, and this file is never committed to git.
 
-### Docker network vs host network
+### Docker Network vs Host Network
 
-With `network_mode: host` a container shares the host's network stack: every port it opens is a host port and containers cannot be isolated from each other. A user-defined bridge network (used here, `inception`) gives each container its own interface and IP, a built-in DNS that resolves service names (`mariadb`, `wordpress`), and lets only explicitly published ports (443) reach the outside. The subject forbids the host network.
+With the host network, a container uses the network of the host directly: every port it opens is open on the host, and containers are not separated from each other. With a Docker network, each container has its own IP address, containers find each other by name (`mariadb`, `wordpress`), and only the published ports are reachable from outside. This project uses one Docker bridge network named `inception` and publishes only port 443. The subject forbids the host network.
 
-### Docker volumes vs bind mounts
+### Docker Volumes vs Bind Mounts
 
-A bind mount maps an arbitrary host path into a container with `-v /path:/path`; Docker does not manage it. A named volume is an object Docker manages (`docker volume ls/inspect/rm`) and that compose creates and shares between services. The subject requires named volumes with the data in `/home/login/data`, so this project declares two named volumes whose `driver_opts` bind them to that folder: Docker manages the volume objects, the bytes live where the subject wants them.
+A bind mount connects a folder of the host directly to a folder in a container; Docker does not manage it. A volume is an object that Docker creates and manages (`docker volume ls`, `docker volume inspect`). The subject asks for named volumes with the data in `/home/login/data`. This project has two named volumes, `mariadb_data` and `wordpress_data`, and their files are stored in `/home/mnahli/data/mariadb` and `/home/mnahli/data/wordpress`.
 
 ## Instructions
 
-Prerequisites: Linux with Docker Engine, Docker Compose v2 and `make`; the line `127.0.0.1 mnahli.42.fr` in `/etc/hosts`; a file `srcs/.env` (see [DEV_DOC.md](DEV_DOC.md) for its variables).
+Requirements: Linux with Docker, Docker Compose and `make`; the line `127.0.0.1 mnahli.42.fr` in `/etc/hosts`; the file `srcs/.env` (its variables are listed in [DEV_DOC.md](DEV_DOC.md)).
 
 ```
-make            # build the three images, create volumes and network, start the stack
-make down       # stop and remove containers and network, keep the data
-make re         # rebuild everything from scratch (removes the data)
+make            # build the images and start everything
+make down       # stop and remove the containers, keep the data
+make re         # delete everything, data included, and build again
 ```
 
 Then open `https://mnahli.42.fr` and accept the self-signed certificate. The administration panel is at `https://mnahli.42.fr/wp-admin`.
 
-More details: [USER_DOC.md](USER_DOC.md) (using the stack) and [DEV_DOC.md](DEV_DOC.md) (building and maintaining it).
+More details are in [USER_DOC.md](USER_DOC.md) and [DEV_DOC.md](DEV_DOC.md).
 
 ## Resources
 
-- Docker documentation: Dockerfile reference, `docker run`, networks, volumes, Compose file reference. https://docs.docker.com/
-- MariaDB knowledge base: `mariadb-install-db`, server system variables, `bind-address`. https://mariadb.com/kb/
-- WP-CLI commands: `core download`, `config create`, `core install`, `user create`. https://developer.wordpress.org/cli/commands/
-- php-fpm configuration (`www.conf`, `listen`, `pm`). https://www.php.net/manual/en/install.fpm.configuration.php
-- NGINX: `ngx_http_ssl_module`, `ngx_http_fastcgi_module`. https://nginx.org/en/docs/
-- OpenSSL `req` manual page (self-signed certificates).
-- Docker course on YouTube by Sami (networking, storage, Dockerfile chapters).
+- Docker documentation: https://docs.docker.com/
+- NGINX documentation: https://nginx.org/en/docs/
+- MariaDB documentation: https://mariadb.com/kb/
+- WP-CLI commands: https://developer.wordpress.org/cli/commands/
+- php-fpm configuration: https://www.php.net/manual/en/install.fpm.configuration.php
+- A Docker course on YouTube (networks, storage, Dockerfile).
 
 ### How AI was used
 
-Claude (Anthropic) was used as a tutor during the whole project, through Claude Code:
+I used an AI assistant as a tutor during the project:
 
-- Explaining concepts before each step (images and layers, PID 1 and `exec`, Docker networks and DNS, overlay storage and volumes, FastCGI, TLS) and answering questions, in English and Arabic.
-- Drafting the two setup scripts (`srcs/requirements/mariadb/tools/init.sh`, `srcs/requirements/wordpress/tools/setup.sh`) and the three documentation files, after the Dockerfiles, configuration files, compose file and Makefile had been written by hand.
-- Reviewing configuration files and reading command output and error messages with me.
+- to explain Docker ideas before each step and to answer my questions;
+- to help me read error messages and command output;
+- to write the first version of the two scripts (`init.sh`, `setup.sh`) and of the three documentation files, which I then read and tested.
 
-Every file was typed, built and tested by me in WSL, one Dockerfile line at a time; AI output was checked against the subject and against real `docker` output before being kept.
+I wrote the Dockerfiles, the configuration files, `docker-compose.yml` and the Makefile myself, and I built and tested everything.
