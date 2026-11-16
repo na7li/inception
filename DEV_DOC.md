@@ -87,7 +87,6 @@ The clean targets remove only the objects of this project.
 
 ```
 docker compose -f srcs/docker-compose.yml ps                 # state of the three containers
-docker ps --format '{{.Names}}  {{.Status}}'                  # name and age of each container
 docker compose -f srcs/docker-compose.yml logs -f wordpress  # log of one service
 docker exec -it mariadb mariadb -u root -p                   # database shell as root
 docker exec -it wordpress bash                               # shell inside a container
@@ -116,3 +115,51 @@ make down && make
 The two volumes are named volumes. Their options in `srcs/docker-compose.yml` (`driver_opts`) tell Docker to store the files in `/home/mnahli/data`, as the subject asks.
 
 The data stays after `make down`, after a reboot and after a container crash, because the files are on the host and not inside the containers. Only `make fclean` and `make re` delete the data.
+
+## Check the rules of the subject
+
+Run these commands from the root of the repository. Each block checks one rule.
+
+```
+# 1. Every image starts from debian:bookworm, no "latest" tag
+grep -n 'FROM' srcs/requirements/*/Dockerfile
+grep -rn 'latest' srcs/
+
+# 2. No fake process to keep a container alive
+grep -rnE 'tail -f|sleep infinity|while true' srcs/
+grep -n 'CMD\|ENTRYPOINT' srcs/requirements/*/Dockerfile
+
+# 3. No host network and no links
+grep -nE 'network_mode|links:|--link' srcs/docker-compose.yml Makefile
+grep -n -A2 '^networks' srcs/docker-compose.yml
+
+# 4. Only nginx opens a port, and it is 443
+grep -n -B4 -A1 'ports:' srcs/docker-compose.yml
+
+# 5. No credentials in git
+git ls-files | grep -iE '\.env|secret'
+git grep -nF -f <(grep PASSWORD srcs/.env | cut -d= -f2-)
+
+# 6. Programs started in the background, and the last line of each script
+grep -nE '&\s*$' srcs/requirements/*/tools/*.sh
+tail -n1 srcs/requirements/*/tools/*.sh
+
+# 7. PID 1 of each container is the real server
+docker top mariadb
+docker top wordpress
+docker top nginx
+```
+
+What a correct result looks like:
+
+| Check | Correct result |
+|---|---|
+| 1 | three lines `FROM debian:bookworm`, and nothing for `latest` |
+| 2 | nothing for the first command; the CMD lines are `init.sh`, `setup.sh` and `nginx -g "daemon off;"` |
+| 3 | nothing for the first command; the network `inception` with `driver: bridge` |
+| 4 | `ports:` only under `nginx`, with `"443:443"` |
+| 5 | nothing for both commands: `.env` is not in git, and no password from `.env` is written in a tracked file |
+| 6 | one line, `init.sh:19`: the temporary `mysqld` used only to create the database; the last lines are `exec mysqld --user=mysql` and `exec php-fpm8.2 -F` |
+| 7 | PID 1 is `mysqld`, `php-fpm` and `nginx`, never `bash`, `sleep` or `tail` |
+
+The two `until … sleep 1` loops in the scripts are not infinite loops. They wait a few seconds for MariaDB to be ready, then the script continues and ends with `exec`.
